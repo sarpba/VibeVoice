@@ -32,6 +32,107 @@ def _resample_if_needed(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
     return wav.astype(np.float32, copy=False)
 
 
+def _energy_vad_segments(
+    wav: np.ndarray,
+    sample_rate: int,
+    *,
+    frame_ms: float = 30.0,
+    hop_ms: float = 10.0,
+    min_speech_sec: float = 0.2,
+    min_silence_sec: float = 0.1,
+) -> List[Tuple[int, int]]:
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return []
+
+    frame_len = int(sample_rate * frame_ms / 1000.0)
+    hop_len = int(sample_rate * hop_ms / 1000.0)
+    if frame_len <= 0 or hop_len <= 0:
+        return []
+
+    energies: List[float] = []
+    frame_starts: List[int] = []
+    for start in range(0, max(wav.size - frame_len + 1, 1), hop_len):
+        frame = wav[start : start + frame_len]
+        energies.append(float(np.mean(frame * frame)))
+        frame_starts.append(start)
+        if start + frame_len >= wav.size:
+            break
+
+    if not energies:
+        return []
+
+    # Simple energy thresholding for VAD (no external deps).
+    energy_arr = np.asarray(energies, dtype=np.float32)
+    threshold = float(np.percentile(energy_arr, 60))
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        threshold = float(np.max(energy_arr))
+    if threshold <= 0.0:
+        return []
+
+    vad_flags = energy_arr > threshold
+    min_speech_frames = max(1, int(round(min_speech_sec * sample_rate / hop_len)))
+    max_silence_frames = max(1, int(round(min_silence_sec * sample_rate / hop_len)))
+
+    segments: List[Tuple[int, int]] = []
+    in_speech = False
+    seg_start = 0
+    silence_count = 0
+    first_silence_idx = 0
+
+    for i, is_speech in enumerate(vad_flags.tolist()):
+        if is_speech:
+            if not in_speech:
+                in_speech = True
+                seg_start = frame_starts[i]
+            silence_count = 0
+        else:
+            if in_speech:
+                if silence_count == 0:
+                    first_silence_idx = i
+                silence_count += 1
+                if silence_count > max_silence_frames:
+                    seg_end = frame_starts[first_silence_idx]
+                    segments.append((seg_start, min(seg_end + frame_len, wav.size)))
+                    in_speech = False
+                    silence_count = 0
+
+    if in_speech:
+        segments.append((seg_start, wav.size))
+
+    min_speech_samples = int(min_speech_sec * sample_rate)
+    return [(s, e) for (s, e) in segments if (e - s) >= min_speech_samples]
+
+
+def _random_vad_crop(
+    wav: np.ndarray,
+    sample_rate: int,
+    *,
+    min_len_sec: float,
+    max_len_sec: float,
+) -> Optional[np.ndarray]:
+    segments = _energy_vad_segments(wav, sample_rate)
+    if not segments:
+        return None
+
+    prompt_len_sec = random.uniform(min_len_sec, max_len_sec)
+    prompt_len_samples = max(1, int(prompt_len_sec * sample_rate))
+
+    seg_start, seg_end = random.choice(segments)
+    seg_len = max(0, seg_end - seg_start)
+    if seg_len == 0:
+        return None
+    if prompt_len_samples > seg_len:
+        prompt_len_samples = seg_len
+
+    max_start = seg_end - prompt_len_samples
+    if max_start < seg_start:
+        start_sample = seg_start
+    else:
+        start_sample = random.randint(seg_start, max_start)
+    return wav[start_sample : start_sample + prompt_len_samples]
+
+
 # Lightweight HF-style dataset wrapper (optional). Trainer can also pass raw HF datasets directly.
 class VibeVoiceDataset:
     def __init__(
@@ -80,15 +181,13 @@ class VibeVoiceDataset:
                 max_len_sec = min(max_len_sec, audio_len_seconds)
 
                 if max_len_sec > 0.1:
-                    prompt_len_sec = random.uniform(min_len_sec, max_len_sec)
-                    prompt_len_samples = int(prompt_len_sec * target_sr)
-
-                    max_start_sample = len(wav_array) - prompt_len_samples
-                    start_sample = random.randint(0, max_start_sample)
-                    
-                    prompt_crop = wav_array[start_sample : start_sample + prompt_len_samples]
-                    
-                    data["voice_prompts"] = [prompt_crop]
+                    prompt_crop = _random_vad_crop(
+                        wav_array,
+                        target_sr,
+                        min_len_sec=min_len_sec,
+                        max_len_sec=max_len_sec,
+                    )
+                    data["voice_prompts"] = [prompt_crop] if prompt_crop is not None else None
                 else:
                     data["voice_prompts"] = None
 
