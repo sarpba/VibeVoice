@@ -139,6 +139,30 @@ class DataArguments:
         default=0.0,
         metadata={"help": "Probability to drop conditioning voice prompt during training (0.0 keep always, 1.0 drop always)."},
     )
+    target_augment_with_silence: bool = field(
+        default=False,
+        metadata={"help": "Apply legacy target-audio leading/trailing silence and fade augmentation."},
+    )
+    target_normalize_audio: bool = field(
+        default=True,
+        metadata={"help": "Normalize target audio by active-speech RMS before acoustic-tokenizer encoding."},
+    )
+    target_normalize_dbfs: float = field(
+        default=-25.0,
+        metadata={"help": "Target active-speech RMS level in dBFS for target audio normalization."},
+    )
+    target_peak_limit_dbfs: float = field(
+        default=-1.0,
+        metadata={"help": "Peak limit in dBFS applied after target audio RMS normalization."},
+    )
+    target_max_gain_db: float = field(
+        default=18.0,
+        metadata={"help": "Maximum gain in dB for target audio RMS normalization."},
+    )
+    target_min_gain_db: float = field(
+        default=-18.0,
+        metadata={"help": "Minimum gain in dB for target audio RMS normalization."},
+    )
 
 @dataclass
 class CustomTrainingArguments(HfTrainingArguments):
@@ -540,6 +564,21 @@ def main() -> None:
         compute_semantics=compute_semantics_flag,
         debug_checks=False,
         voice_prompt_drop_rate=data_args.voice_prompt_drop_rate,
+        target_augment_with_silence=data_args.target_augment_with_silence,
+        target_normalize_audio=data_args.target_normalize_audio,
+        target_normalize_dbfs=data_args.target_normalize_dbfs,
+        target_peak_limit_dbfs=data_args.target_peak_limit_dbfs,
+        target_max_gain_db=data_args.target_max_gain_db,
+        target_min_gain_db=data_args.target_min_gain_db,
+    )
+    logger.info(
+        "Target audio preprocessing -> augment_with_silence=%s, normalize_audio=%s, target_dbfs=%s, peak_limit_dbfs=%s, gain_db=[%s,%s]",
+        data_args.target_augment_with_silence,
+        data_args.target_normalize_audio,
+        data_args.target_normalize_dbfs,
+        data_args.target_peak_limit_dbfs,
+        data_args.target_min_gain_db,
+        data_args.target_max_gain_db,
     )
 
     class LoRADebugCallback(TrainerCallback):

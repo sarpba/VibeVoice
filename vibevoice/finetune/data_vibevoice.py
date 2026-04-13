@@ -17,6 +17,16 @@ try:
 except Exception:  # pragma: no cover
     resampy = None
 
+try:
+    import soundfile as sf  # type: ignore
+except Exception:  # pragma: no cover
+    sf = None
+
+try:
+    from scipy.signal import resample_poly  # type: ignore
+except Exception:  # pragma: no cover
+    resample_poly = None
+
 
 def _resample_if_needed(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     if orig_sr == target_sr:
@@ -25,6 +35,11 @@ def _resample_if_needed(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
         return resampy.resample(wav.astype(np.float32), orig_sr, target_sr)
     if librosa is not None:
         return librosa.resample(y=wav.astype(np.float32), orig_sr=orig_sr, target_sr=target_sr)
+    if resample_poly is not None:
+        gcd = math.gcd(int(orig_sr), int(target_sr))
+        up = int(target_sr) // gcd
+        down = int(orig_sr) // gcd
+        return resample_poly(wav.astype(np.float32), up, down).astype(np.float32, copy=False)
     warnings.warn(
         "No resampler available; treating audio as target_sr without resampling. Install resampy or librosa.",
         RuntimeWarning,
@@ -162,20 +177,119 @@ def _apply_silence_with_crossfade(
     return np.concatenate(pieces)
 
 
+def _dbfs_to_amplitude(dbfs: float) -> float:
+    return float(10.0 ** (dbfs / 20.0))
+
+
+def _amplitude_to_dbfs(amplitude: float, eps: float = 1e-8) -> float:
+    amplitude = max(float(amplitude), eps)
+    return float(20.0 * math.log10(amplitude))
+
+
+def _frame_rms_values(
+    wav: np.ndarray,
+    sample_rate: int,
+    *,
+    frame_ms: float = 30.0,
+    hop_ms: float = 10.0,
+) -> np.ndarray:
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    frame_len = max(1, int(round(sample_rate * frame_ms / 1000.0)))
+    hop_len = max(1, int(round(sample_rate * hop_ms / 1000.0)))
+    if wav.size <= frame_len:
+        return np.asarray([np.sqrt(np.mean(wav.astype(np.float64) ** 2))], dtype=np.float32)
+
+    rms_values: List[float] = []
+    for start in range(0, wav.size - frame_len + 1, hop_len):
+        frame = wav[start : start + frame_len]
+        rms_values.append(float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))))
+    if (wav.size - frame_len) % hop_len != 0:
+        frame = wav[-frame_len:]
+        rms_values.append(float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))))
+    return np.asarray(rms_values, dtype=np.float32)
+
+
+def _normalize_active_rms(
+    wav: np.ndarray,
+    *,
+    sample_rate: int,
+    target_dbfs: float = -25.0,
+    peak_limit_dbfs: float = -1.0,
+    max_gain_db: float = 18.0,
+    min_gain_db: float = -18.0,
+    gate_db_below_peak: float = 35.0,
+    min_gate_dbfs: float = -55.0,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size == 0:
+        return wav
+
+    frame_rms = _frame_rms_values(wav, sample_rate)
+    if frame_rms.size == 0:
+        return wav
+
+    peak_frame_rms = float(np.max(frame_rms))
+    if peak_frame_rms <= eps:
+        return wav
+
+    gate_dbfs = max(_amplitude_to_dbfs(peak_frame_rms, eps) - gate_db_below_peak, min_gate_dbfs)
+    gate_amp = _dbfs_to_amplitude(gate_dbfs)
+    active = frame_rms >= gate_amp
+
+    min_active_frames = max(3, int(round(frame_rms.size * 0.05)))
+    if int(active.sum()) < min_active_frames:
+        fallback_gate = float(np.percentile(frame_rms, 60))
+        active = frame_rms >= fallback_gate
+
+    active_rms_values = frame_rms[active]
+    if active_rms_values.size == 0:
+        return wav
+
+    active_rms = float(np.sqrt(np.mean(active_rms_values.astype(np.float64) ** 2)))
+    if active_rms <= eps:
+        return wav
+
+    gain = _dbfs_to_amplitude(target_dbfs) / active_rms
+    min_gain = _dbfs_to_amplitude(min_gain_db)
+    max_gain = _dbfs_to_amplitude(max_gain_db)
+    gain = float(np.clip(gain, min_gain, max_gain))
+
+    peak = float(np.max(np.abs(wav)))
+    peak_limit = _dbfs_to_amplitude(peak_limit_dbfs)
+    if peak > eps and peak * gain > peak_limit:
+        gain = peak_limit / peak
+
+    return (wav * gain).astype(np.float32, copy=False)
+
+
 def _load_audio_to_24k(
     audio: Union[str, np.ndarray, torch.Tensor, Dict[str, Any]],
     *,
     target_sr: int = 24000,
     augment_with_silence: bool = False,
+    normalize_active_rms: bool = False,
+    target_dbfs: float = -25.0,
+    peak_limit_dbfs: float = -1.0,
+    max_gain_db: float = 18.0,
+    min_gain_db: float = -18.0,
 ) -> np.ndarray:
     if isinstance(audio, np.ndarray):
         wav_out = audio.astype(np.float32)
     elif isinstance(audio, torch.Tensor):
         wav_out = audio.detach().cpu().float().numpy()
     elif isinstance(audio, str):
-        if librosa is None:
-            raise RuntimeError("librosa is required to load audio file paths. Please pip install librosa.")
-        wav, sr = librosa.load(audio, sr=None, mono=True)
+        if librosa is not None:
+            wav, sr = librosa.load(audio, sr=None, mono=True)
+        elif sf is not None:
+            wav, sr = sf.read(audio, dtype="float32", always_2d=False)
+            if getattr(wav, "ndim", 1) > 1:
+                wav = np.mean(wav, axis=1)
+        else:
+            raise RuntimeError("librosa or soundfile is required to load audio file paths.")
         wav_out = _resample_if_needed(wav, int(sr), target_sr)
     elif isinstance(audio, dict) and "array" in audio and "sampling_rate" in audio:
         arr = np.asarray(audio["array"], dtype=np.float32)
@@ -185,6 +299,16 @@ def _load_audio_to_24k(
         raise ValueError(f"Unsupported audio type: {type(audio)}")
 
     wav_out = np.asarray(wav_out, dtype=np.float32)
+
+    if normalize_active_rms:
+        wav_out = _normalize_active_rms(
+            wav_out,
+            sample_rate=target_sr,
+            target_dbfs=target_dbfs,
+            peak_limit_dbfs=peak_limit_dbfs,
+            max_gain_db=max_gain_db,
+            min_gain_db=min_gain_db,
+        )
 
     if augment_with_silence:
         wav_out = _apply_silence_with_crossfade(wav_out, sample_rate=target_sr)
@@ -205,6 +329,12 @@ class VibeVoiceCollator:
     audio_field: str = "audio"
     voice_prompts_field: str = "voice_prompts"
     voice_prompt_drop_rate: float = 0.0
+    target_augment_with_silence: bool = False
+    target_normalize_audio: bool = True
+    target_normalize_dbfs: float = -25.0
+    target_peak_limit_dbfs: float = -1.0
+    target_max_gain_db: float = 18.0
+    target_min_gain_db: float = -18.0
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         batch_size = len(features)
@@ -246,7 +376,16 @@ class VibeVoiceCollator:
                 speech_input_mask = torch.zeros_like(proc["input_ids"], dtype=torch.bool)
             speech_input_mask_list = speech_input_mask[0].tolist()
 
-            wav_target = _load_audio_to_24k(target_audio, target_sr=24000, augment_with_silence=True)
+            wav_target = _load_audio_to_24k(
+                target_audio,
+                target_sr=24000,
+                augment_with_silence=self.target_augment_with_silence,
+                normalize_active_rms=self.target_normalize_audio,
+                target_dbfs=self.target_normalize_dbfs,
+                peak_limit_dbfs=self.target_peak_limit_dbfs,
+                max_gain_db=self.target_max_gain_db,
+                min_gain_db=self.target_min_gain_db,
+            )
             # Prefer exact frame count from acoustic tokenizer if available; fallback to compress ratio
             target_latent_len = None
             try:
